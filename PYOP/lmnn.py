@@ -1,151 +1,95 @@
 import mxnet as mx
 import numpy as np
 
-eps = 1e-20
 
+class LMNNLoss(mx.operator.CustomOp):
+    '''
+    LMNN Loss Layer = positive pairwise loss + triplet loss
+    '''
+    def __init__(self, epsilon, threshd, grad_scale):
+        self.epsilon = epsilon      # epsilon is the trade-off parameter between positive pairwise and triplet loss(1: epsilon)
+        self.threshd = threshd
+        self.grad_scale = grad_scale
 
-def relu(x):
-    return np.maximum(x, 0)
-
-
-class LMNNOp(mx.operator.CustomOp):
-    """
-       lmnn loss improved with focal loss (focal loss for dense object detection)
-    """
-
-    def __init__(self, **kwargs):
-        super(LMNNOp, self).__init__()
-        self.margin = float(kwargs.get('margin', 0.9))
-        self.epsilon = float(kwargs.get('epsilon', 0.1))
-
+    
     def forward(self, is_train, req, in_data, out_data, aux):
-        X = in_data[0].asnumpy()
-        L = np.zeros(shape=(X.shape[0], ))
-        for i in range(X.shape[0] / 2):
-            a = i  # anchor index
-            p = (i + 1) if i % 2 == 0 else (i - 1)  # positive sample index
-            n = list(set(range(X.shape[0])) - {a, p})  # negative sample indexes
-            Xa, Xp, Xn = X[a], X[p], X[n, :]
-            pdist2 = ((Xa - Xp) ** 2).sum()  # square of distance between anchor and positive sample
-            ndist2 = ((Xa - Xn) ** 2).sum(axis=1, keepdims=True)  # square of distance between anchor and negative samples
-            triplet = pdist2 - ndist2 + 2 * self.margin
-            L[i] = 0.5 * (pdist2 + self.epsilon * relu(triplet).mean())
-        self.assign(out_data[0], req[0], L)
+        x = in_data[0]
+        ctx = x.context
+        y = mx.nd.zeros((x.shape[0], ), ctx=ctx)
+        halfsize = x.shape[0] / 2
+        
+        for i in range(halfsize):
+            pid = i + 1 if i % 2 == 0 else i - 1
+            pdiff = x[i] - x[pid]
+            pdist = 0.5 * mx.nd.sum(pdiff * pdiff)
+            mask = mx.nd.ones((x.shape[0],), ctx=ctx)    # index mask for negative examples
+            mask[i] = 0
+            mask[pid] = 0
+            ndiff = x[i] - x
+            ndist = 0.5 * mx.nd.sum(ndiff * ndiff, axis=1)
+            distdiff = (pdist - ndist + self.threshd) * mask  
+            distdiff = mx.nd.sum(mx.nd.maximum(0, distdiff)) / mx.nd.sum(mask)
+            y[i] = pdist + self.epsilon*distdiff   
 
+        self.assign(out_data[0], req[0], y)                     
+            
+    
     def backward(self, req, out_grad, in_data, out_data, in_grad, aux):
-        X = in_data[0].asnumpy()
-        G = np.zeros_like(X)
-        for i in range(X.shape[0] / 2):
-            a = i  # anchor index
-            p = (i + 1) if i % 2 == 0 else (i - 1)  # positive sample index
-            n = list(set(range(X.shape[0])) - {a, p})  # negative sample indexes
-            Xa, Xp, Xn = X[a], X[p], X[n, :]
-            pdiff = Xa - Xp
-            pdist2 = ((Xa - Xp) ** 2).sum()  # square of distance between anchor and positive sample
-            ndist2 = ((Xa - Xn) ** 2).sum(axis=1, keepdims=True)  # square of distance between anchor and negative samples
-            triplet = pdist2 - ndist2 + 2 * self.margin
-            G[i] = pdiff + self.epsilon * ((Xn - Xp) * (triplet > 0)).mean(axis=0)
-        self.assign(in_grad[0], req[0], G)
+        x = in_data[0]
+        ctx = x.context
+        grad = in_grad[0]
+        grad[:] = 0
+        batchsize = x.shape[0]
+                     
+        for i in range(batchsize / 2):
+            pid = i + 1 if i % 2 == 0 else i - 1
+            grad[i] += (x[i] - x[pid]) 
+            grad[pid] += (x[pid] - x[i]) 
+                
+            mask = np.ones((batchsize,))   # index mask for negative examples
+            mask[i] = 0
+            mask[pid] = 0   
 
-
-@mx.operator.register("LMNN")
-class LMNNProp(mx.operator.CustomOpProp):
-    def __init__(self, **kwargs):
-        super(LMNNProp, self).__init__(need_top_grad=False)
-        self._kwargs = kwargs
-
+            pdiff = x[i] - x[pid]
+            pdist = 0.5 * mx.nd.sum(pdiff * pdiff)                  
+            ndiff = x[i] - x
+            ndist = 0.5 * mx.nd.sum(ndiff * ndiff, axis=1)
+            distdiff = pdist - ndist + self.threshd
+         
+            index = np.zeros((batchsize, ))
+            index[np.where(distdiff.asnumpy() > 0)] = 1
+            index = index * mask
+            index = mx.nd.array(index, ctx=ctx)
+                                      
+            ratio = index / (batchsize - 2)  #distdiff * index / (mx.nd.sum(distdiff * index) + 1e-6)
+            ratio = mx.nd.Reshape(ratio, shape=(batchsize,1))
+            ratio = mx.nd.broadcast_axis(ratio, axis=1, size=x.shape[1])
+             
+            grad[i] += mx.nd.sum((x - x[pid]) * ratio, axis=0) * self.epsilon
+            grad[pid] += (x[pid] - x[i]) * (mx.nd.sum(index) / (batchsize - 2)) * self.epsilon   #(mx.nd.sum(distdiff * index) / (mx.nd.sum(distdiff * index) + 1e-6)) * self.epsilon
+            grad += (x[i] - x) * ratio * self.epsilon
+               
+        self.assign(in_grad[0], req[0], grad * self.grad_scale)
+           
+           
+@mx.operator.register("LMNNLoss")
+class LMNNLossProp(mx.operator.CustomOpProp):
+    def __init__(self, epsilon=0.1, threshd=0.9, grad_scale=1.0):
+        super(LMNNLossProp, self).__init__(need_top_grad=False)
+        self.epsilon = float(epsilon)
+        self.threshd = float(threshd)
+        self.grad_scale = float(grad_scale)
+     
     def list_arguments(self):
-        return ['data']
-
+        return ['data']  
+    
     def list_outputs(self):
-        return ['output']
+        return ['output']   
 
     def infer_shape(self, in_shape):
-        assert len(in_shape) == 1, "LMNN input data: [l2_embedding]"
-        dshape = in_shape[0]
-        assert len(dshape) == 2, "data shape should be (batch_size, embedding_dim), found %s" % dshape
-        oshape = (dshape[0], )
-        return [dshape], [oshape], []
+        data_shape = in_shape[0] 
+        output_shape = (in_shape[0][0], )       
+        return [data_shape], [output_shape]
 
     def create_operator(self, ctx, shapes, dtypes):
-        self._kwargs['shape'] = shapes[0]
-        return LMNNOp(**self._kwargs)
-
-
-def grad_check():
-    import random
-    DELTA = 1e-3
-    RTOL = 1e-2
-    NUM_TEST_TRIAL = 1000
-
-    X = mx.sym.var('data')
-    random_margin = random.random()
-    random_epsilon = random.random() * 10
-    sym = mx.sym.Custom(data=X, margin=random_margin, epsilon=random_epsilon, op_type='LMNN')
-
-    batch_size = 8
-    num_dim = 10
-    data_shape = (batch_size, num_dim)
-    data = mx.nd.array(np.random.normal(size=data_shape), ctx=mx.cpu())
-    data = mx.nd.L2Normalization(data)
-
-    for i in range(NUM_TEST_TRIAL):
-        random_batch_idx = random.randint(0, batch_size / 2 - 1)
-        random_feature_idx = random.randint(0, num_dim - 1)
-        data_p = data.copy()
-        data_p[random_batch_idx][random_feature_idx] += DELTA
-        data_m = data.copy()
-        data_m[random_batch_idx][random_feature_idx] -= DELTA
-        exe = sym.simple_bind(ctx=mx.cpu(), data=data_shape)
-
-        exe.forward(data=data, is_train=True)
-        exe.backward()
-        L_sym = exe.outputs[0].asnumpy()[random_batch_idx]
-        G_sym = exe.grad_arrays[0].asnumpy()[random_batch_idx, random_feature_idx]
-
-        exe.forward(data=data_p, is_train=False)
-        L_p = exe.outputs[0].asnumpy()[random_batch_idx]
-
-        exe.forward(data=data_m, is_train=False)
-        L_m = exe.outputs[0].asnumpy()[random_batch_idx]
-
-        G_num = (L_p - L_m) / (2 * DELTA)
-
-        print G_sym
-        print G_num
-        assert abs((G_num - G_sym) / G_sym) < RTOL, "gradient check failed at delta=%g, rtol=%g" % (DELTA, RTOL)
-
-
-def speed_test(compare=False):
-    """
-    E5-2650v3, 1024d vector
-    forward+backward 6000 samples/s
-    backward only 9000 samples/s
-    old implementation <1000 samples/s
-    """
-    import time
-
-    X = mx.sym.var('data')
-    if compare:
-        sym = mx.sym.Custom(data=X, threshd=0.9, epsilon=0.1, op_type='lmnnLoss')
-    else:
-        sym = mx.sym.Custom(data=X, margin=0.9, epsilon=0.1, op_type='LMNN')
-
-    batch_size = 8
-    num_batch = 1000
-    num_dim = 1024
-    data_shape = (batch_size, num_dim)
-    data = mx.nd.array(np.random.rand(*data_shape), ctx=mx.cpu())
-    exe = sym.simple_bind(ctx=mx.cpu(), data=data_shape)
-
-    tic = time.time()
-    for i in range(num_batch):
-        exe.forward(data=data, is_train=True)
-        exe.backward()
-        out = exe.outputs[0]
-        _ = out.asnumpy()
-    toc = time.time()
-    print("Vanilla LMNN processed {} 1024d features per second".format(round(num_batch * batch_size / (toc - tic))))
-
-if __name__ == '__main__':
-    speed_test()
+        return LMNNLoss(self.epsilon, self.threshd, self.grad_scale)
